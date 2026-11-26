@@ -911,6 +911,66 @@ impl Assembler
             }
         }
 
+        /// Return true if NZCV condition flags cannot be read starting at `start_idx`
+        /// before being overwritten or reaching the end of the block.
+        fn flags_dead_after(insns: &[Insn], start_idx: usize) -> bool {
+            let mut idx = start_idx;
+            while let Some(insn) = insns.get(idx) {
+                match insn {
+                    // Instructions that overwrite NZCV or exit the block without reading NZCV
+                    Insn::Add { .. }
+                    | Insn::Sub { .. }
+                    | Insn::Cmp { .. }
+                    | Insn::Test { .. }
+                    | Insn::IncrCounter { .. }
+                    | Insn::CPopAll
+                    | Insn::CCall { .. }
+                    | Insn::CRet { .. }
+                    | Insn::Jmp(_)
+                    | Insn::JmpOpnd(_) => return true,
+
+                    // Mul followed by JoMul overwrites NZCV via CMP
+                    Insn::Mul { .. } => {
+                        if matches!(
+                            (insns.get(idx + 1), insns.get(idx + 2)),
+                            (Some(Insn::JoMul(_)), _) | (Some(Insn::PosMarker(_)), Some(Insn::JoMul(_)))
+                        ) {
+                            return true;
+                        }
+                        idx += 1;
+                    }
+
+                    // Instructions that read NZCV (or labels that could merge flag-live paths)
+                    Insn::Label(_)
+                    | Insn::CPushAll
+                    | Insn::Je(_)
+                    | Insn::Jz(_)
+                    | Insn::Jne(_)
+                    | Insn::Jnz(_)
+                    | Insn::JoMul(_)
+                    | Insn::Jl(_)
+                    | Insn::Jg(_)
+                    | Insn::Jge(_)
+                    | Insn::Jbe(_)
+                    | Insn::Jb(_)
+                    | Insn::Jo(_)
+                    | Insn::CSelZ { .. }
+                    | Insn::CSelE { .. }
+                    | Insn::CSelNZ { .. }
+                    | Insn::CSelNE { .. }
+                    | Insn::CSelL { .. }
+                    | Insn::CSelLE { .. }
+                    | Insn::CSelG { .. }
+                    | Insn::CSelGE { .. } => return false,
+
+                    _ => {
+                        idx += 1;
+                    }
+                }
+            }
+            true
+        }
+
         // dbg!(&self.insns);
 
         // List of GC offsets
@@ -927,6 +987,7 @@ impl Assembler
             let had_dropped_bytes = cb.has_dropped_bytes();
             let old_label_state = cb.get_label_state();
             let mut insn_gc_offsets: Vec<u32> = Vec::new();
+            let mut insn_step: usize = 1;
 
             match insn {
                 Insn::Comment(text) => {
@@ -1189,7 +1250,55 @@ impl Assembler
                     cmp(cb, left.into(), right.into());
                 },
                 Insn::Test { left, right } => {
-                    tst(cb, left.into(), right.into());
+                    // Fuse single-bit Test + Jz/Je/Jnz/Jne to a SideExit into TBZ/TBNZ
+                    // when NZCV flags are dead afterwards and the target fits in imm14.
+                    let left_opnd = *left;
+                    let right_opnd = *right;
+                    let mut merged_tbz = false;
+                    if let (Opnd::Reg(reg), Opnd::UImm(mask)) = (left_opnd, right_opnd) {
+                        let single_bit = (reg.num_bits == 64 && mask.is_power_of_two())
+                            || (reg.num_bits == 32 && mask <= (u32::MAX as u64) && (mask as u32).is_power_of_two());
+                        if reg.reg_no != 31 && single_bit {
+                            let next_jump = match self.insns.get(insn_idx + 1) {
+                                Some(Insn::Jz(t) | Insn::Je(t))
+                                    if matches!(t, Target::SideExit { .. } | Target::SideExitPtr(_)) =>
+                                {
+                                    Some((*t, true))
+                                }
+                                Some(Insn::Jnz(t) | Insn::Jne(t))
+                                    if matches!(t, Target::SideExitPtr(_) | Target::SideExit { .. }) =>
+                                {
+                                    Some((*t, false))
+                                }
+                                _ => None,
+                            };
+                            if let Some((raw_target, branch_if_zero)) = next_jump {
+                                if flags_dead_after(&self.insns, insn_idx + 2) {
+                                    if let Target::SideExitPtr(dst_ptr) = compile_side_exit(raw_target, self, ocb)? {
+                                        let dst_addr = dst_ptr.as_offset();
+                                        let src_addr = cb.get_write_ptr().as_offset();
+                                        let byte_diff = dst_addr - src_addr;
+                                        let offset_insns = byte_diff / 4;
+                                        if (byte_diff & 3) == 0 && imm_fits_bits(offset_insns, 14) {
+                                            let bit_num = u64::from(mask.trailing_zeros());
+                                            let rt = A64Opnd::Reg(A64Reg { num_bits: 64, reg_no: reg.reg_no });
+                                            if branch_if_zero {
+                                                tbz(cb, rt, A64Opnd::UImm(bit_num), A64Opnd::Imm(offset_insns));
+                                            } else {
+                                                tbnz(cb, rt, A64Opnd::UImm(bit_num), A64Opnd::Imm(offset_insns));
+                                            }
+                                            insn_step = 2;
+                                            merged_tbz = true;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    if !merged_tbz {
+                        tst(cb, left_opnd.into(), right_opnd.into());
+                    }
                 },
                 Insn::JmpOpnd(opnd) => {
                     br(cb, opnd.into());
@@ -1307,7 +1416,7 @@ impl Assembler
                     return Err(EmitError::RetryOnNextPage);
                 }
             } else {
-                insn_idx += 1;
+                insn_idx += insn_step;
                 gc_offsets.append(&mut insn_gc_offsets);
             }
         }
@@ -1859,5 +1968,32 @@ mod tests {
             0x4: mul x11, x9, x11
             0x8: mov x1, x11
         "});
+    }
+
+    #[test]
+    fn test_fuse_single_bit_test_to_tbz_tbnz() {
+        let (mut asm, mut cb) = setup_asm();
+        let side_exit = cb.get_ptr(0x200);
+        let code_target = cb.get_ptr(0x240);
+
+        // Single-bit test + Jnz(SideExitPtr) -> single tbnz (4 bytes)
+        asm.test(Opnd::Reg(X1_REG), Opnd::UImm(1));
+        asm.jnz(Target::SideExitPtr(side_exit));
+
+        // Single-bit test + Jz(SideExitPtr) with live flags consumed by CSelZ -> must NOT fuse (tst + b.eq + csel = 12 bytes)
+        asm.test(Opnd::Reg(X1_REG), Opnd::UImm(8));
+        asm.jz(Target::SideExitPtr(side_exit));
+        let sel = asm.csel_z(Opnd::Reg(X1_REG), Opnd::Reg(X9_REG));
+        asm.mov(Opnd::Reg(X9_REG), sel);
+
+        // Single-bit test + Jz(CodePtr) -> must NOT fuse (patchable jump keeps tst + padded b.eq)
+        asm.test(Opnd::Reg(X1_REG), Opnd::UImm(1));
+        asm.jz(Target::CodePtr(code_target));
+
+        asm.compile_with_num_regs(&mut cb, 2);
+
+        // First guard fused to 1 insn (4B); second kept tst+b.eq+csel (12B);
+        // third kept tst + 2-insn padded jump for <=128MiB region (12B) = 28B
+        assert_eq!(28, cb.get_write_pos());
     }
 }
