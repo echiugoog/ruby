@@ -927,6 +927,7 @@ impl Assembler
             let had_dropped_bytes = cb.has_dropped_bytes();
             let old_label_state = cb.get_label_state();
             let mut insn_gc_offsets: Vec<u32> = Vec::new();
+            let mut insn_step: usize = 1;
 
             match insn {
                 Insn::Comment(text) => {
@@ -1021,14 +1022,50 @@ impl Assembler
                     lsl(cb, out.into(), opnd.into(), shift.into());
                 },
                 Insn::Store { dest, src } => {
-                    // This order may be surprising but it is correct. The way
-                    // the Arm64 assembler works, the register that is going to
-                    // be stored is first and the address is second. However in
-                    // our IR we have the address first and the register second.
-                    match dest.rm_num_bits() {
-                        64 | 32 => stur(cb, src.into(), dest.into()),
-                        16 => sturh(cb, src.into(), dest.into()),
-                        num_bits => panic!("unexpected dest num_bits: {} (src: {:#?}, dest: {:#?})", num_bits, src, dest),
+                    // Coalesce adjacent 8-byte aligned 64-bit stores sharing the same base
+                    // register into a single signed-offset STP instruction.
+                    let mut merged_stp = false;
+                    if let (
+                        Opnd::Mem(Mem { base: MemBase::Reg(b1), disp: d1, num_bits: 64 }),
+                        Opnd::Reg(r1),
+                        Some(Insn::Store {
+                            dest: Opnd::Mem(Mem { base: MemBase::Reg(b2), disp: d2, num_bits: 64 }),
+                            src: Opnd::Reg(r2),
+                        }),
+                    ) = (dest, src, self.insns.get(insn_idx + 1))
+                    {
+                        if b1 == b2 && r1.num_bits == 64 && r2.num_bits == 64 {
+                            let diff = i64::from(*d2) - i64::from(*d1);
+                            if diff == 8 || diff == -8 {
+                                let (low_disp, rt1, rt2) = if diff == 8 {
+                                    (*d1, *r1, *r2)
+                                } else {
+                                    (*d2, *r2, *r1)
+                                };
+                                if low_disp % 8 == 0 && (-512..=504).contains(&low_disp) {
+                                    stp(
+                                        cb,
+                                        A64Opnd::Reg(rt1),
+                                        A64Opnd::Reg(rt2),
+                                        A64Opnd::new_mem(64, A64Opnd::Reg(A64Reg { num_bits: 64, reg_no: *b1 }), low_disp),
+                                    );
+                                    insn_step = 2;
+                                    merged_stp = true;
+                                }
+                            }
+                        }
+                    }
+
+                    if !merged_stp {
+                        // This order may be surprising but it is correct. The way
+                        // the Arm64 assembler works, the register that is going to
+                        // be stored is first and the address is second. However in
+                        // our IR we have the address first and the register second.
+                        match dest.rm_num_bits() {
+                            64 | 32 => stur(cb, src.into(), dest.into()),
+                            16 => sturh(cb, src.into(), dest.into()),
+                            num_bits => panic!("unexpected dest num_bits: {} (src: {:#?}, dest: {:#?})", num_bits, src, dest),
+                        }
                     }
                 },
                 Insn::Load { opnd, out } |
@@ -1307,7 +1344,7 @@ impl Assembler
                     return Err(EmitError::RetryOnNextPage);
                 }
             } else {
-                insn_idx += 1;
+                insn_idx += insn_step;
                 gc_offsets.append(&mut insn_gc_offsets);
             }
         }
@@ -1859,5 +1896,24 @@ mod tests {
             0x4: mul x11, x9, x11
             0x8: mov x1, x11
         "});
+    }
+
+    #[test]
+    fn test_coalesce_adjacent_stores_to_stp() {
+        let (mut asm, mut cb) = setup_asm();
+
+        // Ascending pair [x19, #-0x28] + [x19, #-0x20] with same source reg (xzr, xzr)
+        asm.store(Opnd::mem(64, CFP, -0x28), Opnd::UImm(0));
+        asm.store(Opnd::mem(64, CFP, -0x20), Opnd::UImm(0));
+        // Descending pair [x21, #8] + [x21, #0] -> stp x9, x1, [x21]
+        asm.store(Opnd::mem(64, SP, 8), Opnd::Reg(X1_REG));
+        asm.store(Opnd::mem(64, SP, 0), Opnd::Reg(X9_REG));
+        // Unaligned pair [x21, #4] + [x21, #12] -> must stay two stur instructions
+        asm.store(Opnd::mem(64, SP, 4), Opnd::Reg(X1_REG));
+        asm.store(Opnd::mem(64, SP, 12), Opnd::Reg(X9_REG));
+        asm.compile_with_num_regs(&mut cb, 1);
+
+        // 1 stp + 1 stp + 2 stur = 4 instructions = 16 bytes
+        assert_eq!(16, cb.get_write_pos());
     }
 }
