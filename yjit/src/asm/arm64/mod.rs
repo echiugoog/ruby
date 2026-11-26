@@ -107,16 +107,17 @@ pub fn adr(cb: &mut CodeBlock, rd: A64Opnd, imm: A64Opnd) {
 
 /// ADRP - form a PC-relative address to a 4KB page and load it into a register.
 /// This is effectively the same as ADR except that the immediate must be a
-/// multiple of 4KB.
+/// multiple of 4KB and spans +/-4GB (21-bit signed page offset).
 pub fn adrp(cb: &mut CodeBlock, rd: A64Opnd, imm: A64Opnd) {
     let bytes: [u8; 4] = match (rd, imm) {
         (A64Opnd::Reg(rd), A64Opnd::Imm(imm)) => {
             assert!(rd.num_bits == 64, "The destination register must be 64 bits.");
-            assert!(imm_fits_bits(imm, 32), "The immediate operand must be 32 bits or less.");
+            assert_eq!(imm & 0xfff, 0, "The immediate operand to adrp must be 4KB-aligned.");
+            assert!(imm_fits_bits(imm >> 12, 21), "The page offset operand must be 21 bits or less.");
 
-            PCRelative::adrp(rd.reg_no, imm as i32).into()
+            PCRelative::adrp(rd.reg_no, imm).into()
         },
-        _ => panic!("Invalid operand combination to adr instruction."),
+        _ => panic!("Invalid operand combination to adrp instruction."),
     };
 
     cb.write_bytes(&bytes);

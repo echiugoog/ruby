@@ -1131,10 +1131,20 @@ impl Assembler
 
                         mov(cb, out.into(), Self::SCRATCH0);
                     } else {
-                        // Set output to the jump target's raw address
+                        // Set output to the jump target's raw address using constant-size 8-byte
+                        // ADRP + ADD when within +/-4GiB so stub regeneration never enlarges code.
                         let target_code = target.unwrap_code_ptr();
-                        let target_addr = target_code.raw_addr(cb).as_u64();
-                        emit_load_value(cb, out.into(), target_addr);
+                        let pc_page = (cb.get_write_ptr().raw_addr(cb) as i64) & !0xfff;
+                        let dst_addr = target_code.raw_addr(cb);
+                        let dst_page = (dst_addr as i64) & !0xfff;
+                        let page_delta = dst_page.wrapping_sub(pc_page);
+                        if (page_delta & 0xfff) == 0 && imm_fits_bits(page_delta >> 12, 21) {
+                            let lo12 = (dst_addr as u64) & 0xfff;
+                            adrp(cb, out.into(), A64Opnd::new_imm(page_delta));
+                            add(cb, out.into(), out.into(), A64Opnd::new_uimm(lo12));
+                        } else {
+                            emit_load_value(cb, out.into(), dst_addr.as_u64());
+                        }
                     }
                 },
                 Insn::CPush(opnd) => {
@@ -1174,12 +1184,24 @@ impl Assembler
                     let dst_addr = *fptr as i64;
 
                     // Use BL if the offset is short enough to encode as an immediate.
-                    // Otherwise, use BLR with a register.
+                    // Otherwise use ADRP+ADD+BLR within +/-4GiB, or MOVZ/MOVK+BLR beyond that.
                     if b_offset_fits_bits((dst_addr - src_addr) / 4) {
                         bl(cb, InstructionOffset::from_bytes((dst_addr - src_addr) as i32));
                     } else {
-                        emit_load_value(cb, Self::SCRATCH0, dst_addr as u64);
-                        blr(cb, Self::SCRATCH0);
+                        let pc_page = src_addr & !0xfff;
+                        let dst_page = dst_addr & !0xfff;
+                        let page_delta = dst_page.wrapping_sub(pc_page);
+                        if (page_delta & 0xfff) == 0 && imm_fits_bits(page_delta >> 12, 21) {
+                            let lo12 = (dst_addr as u64) & 0xfff;
+                            adrp(cb, Self::SCRATCH0, A64Opnd::new_imm(page_delta));
+                            if lo12 != 0 {
+                                add(cb, Self::SCRATCH0, Self::SCRATCH0, A64Opnd::new_uimm(lo12));
+                            }
+                            blr(cb, Self::SCRATCH0);
+                        } else {
+                            emit_load_value(cb, Self::SCRATCH0, dst_addr as u64);
+                            blr(cb, Self::SCRATCH0);
+                        }
                     }
                 },
                 Insn::CRet { .. } => {
@@ -1847,6 +1869,22 @@ mod tests {
     }
 
     #[test]
+    fn test_lea_jump_target_adrp_add() {
+        let mut asm = Assembler::new(0);
+        let mut cb = CodeBlock::new_dummy(16 * 1024);
+
+        // Cross-4KiB-page target where (dst & 0xfff) < (pc & 0xfff)
+        cb.set_pos(0xf00);
+        let target = cb.get_ptr(0x2104);
+        let out = asm.lea_jump_target(Target::CodePtr(target));
+        asm.store(Opnd::mem(64, CFP, -8), out);
+        asm.compile_with_num_regs(&mut cb, 1);
+
+        // 2 instructions for LeaJumpTarget (adrp + add) + 1 instruction for stur = 12 bytes
+        assert_eq!(0xf00 + 12, cb.get_write_pos());
+    }
+
+    #[test]
     fn test_mul_with_immediate() {
         let (mut asm, mut cb) = setup_asm();
 
@@ -1859,5 +1897,20 @@ mod tests {
             0x4: mul x11, x9, x11
             0x8: mov x1, x11
         "});
+    }
+
+    #[test]
+    fn test_ccall_adrp_add_blr_within_4gib() {
+        let (mut asm, mut cb) = setup_asm();
+        let base_page = (cb.get_write_ptr().raw_ptr(&cb) as usize) & !0xfff;
+        // 200 MiB away (> 128 MiB BL limit, < 4 GiB ADRP limit):
+        // non-zero page offset (adrp + add + blr = 12B) + zero page offset (adrp + blr = 8B)
+        let near_unaligned = (base_page + 200 * 1024 * 1024 + 0x120) as *const u8;
+        let near_page_aligned = (base_page + 200 * 1024 * 1024) as *const u8;
+        asm.ccall(near_unaligned, vec![]);
+        asm.ccall(near_page_aligned, vec![]);
+        asm.compile_with_num_regs(&mut cb, 1);
+
+        assert_eq!(20, cb.get_write_pos());
     }
 }

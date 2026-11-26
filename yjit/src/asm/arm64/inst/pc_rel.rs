@@ -37,8 +37,10 @@ impl PCRelative {
 
     /// ADRP
     /// <https://developer.arm.com/documentation/ddi0602/2022-03/Base-Instructions/ADRP--Form-PC-relative-address-to-4KB-page->
-    pub fn adrp(rd: u8, imm: i32) -> Self {
-        Self { rd, imm: imm >> 12, op: Op::ADRP }
+    pub fn adrp(rd: u8, imm: i64) -> Self {
+        assert_eq!(imm & 0xfff, 0, "The immediate operand to adrp must be 4KB-aligned.");
+        let page_imm: i32 = (imm >> 12).try_into().unwrap();
+        Self { rd, imm: page_imm, op: Op::ADRP }
     }
 }
 
@@ -103,5 +105,23 @@ mod tests {
         let inst = PCRelative::adrp(0, -0x4000);
         let result: u32 = inst.into();
         assert_eq!(0x90ffffe0, result);
+    }
+
+    #[test]
+    fn test_adrp_4gib_boundaries() {
+        // +2 GiB (exceeds i32::MAX, fits in 21-bit signed page offset: +0x80000 pages)
+        let inst_2g = PCRelative::adrp(11, 0x8000_0000);
+        let res_2g: u32 = inst_2g.into();
+        assert_eq!(0x9040000b, res_2g);
+
+        // +4 GiB - 4 KiB (maximum positive ADRP offset: +0xfffff pages)
+        let inst_max = PCRelative::adrp(11, 0xffff_f000);
+        let res_max: u32 = inst_max.into();
+        assert_eq!(0xf07fffeb, res_max);
+
+        // -4 GiB (minimum negative ADRP offset: -0x100000 pages)
+        let inst_min = PCRelative::adrp(11, -0x1_0000_0000);
+        let res_min: u32 = inst_min.into();
+        assert_eq!(0x9080000b, res_min);
     }
 }
