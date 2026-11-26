@@ -128,6 +128,32 @@ impl Assembler
     /// Split IR instructions for the x86 platform
     fn x86_split(mut self) -> Assembler
     {
+        fn lower_peek_dest(asm: &Assembler, dest: &Opnd) -> Opnd {
+            if let Opnd::Stack { .. } = dest {
+                asm.lower_stack_opnd(dest)
+            } else {
+                *dest
+            }
+        }
+
+        fn opnd_uses_reg_no(opnd: &Opnd, reg_no: u8) -> bool {
+            match opnd {
+                Opnd::Reg(r) => r.reg_no == reg_no,
+                Opnd::Mem(Mem { base: MemBase::Reg(r_no), .. }) => *r_no == reg_no,
+                _ => false,
+            }
+        }
+
+        fn add_sub_disp32(is_sub: bool, right: &Opnd) -> Option<i32> {
+            let val: i128 = match right {
+                Opnd::Imm(v) => *v as i128,
+                Opnd::UImm(u) => *u as i128,
+                _ => return None,
+            };
+            let signed = if is_sub { -val } else { val };
+            i32::try_from(signed).ok()
+        }
+
         let live_ranges: Vec<usize> = take(&mut self.live_ranges);
         let mut asm = Assembler::new_with_label_names(take(&mut self.label_names), take(&mut self.side_exits), self.num_locals);
         let mut iterator = self.into_draining_iter();
@@ -179,6 +205,10 @@ impl Assembler
                 };
             }
 
+            let is_add = matches!(insn, Insn::Add { .. });
+            let is_sub = matches!(insn, Insn::Sub { .. });
+            let is_mul = matches!(insn, Insn::Mul { .. });
+
             // We are replacing instructions here so we know they are already
             // being used. It is okay not to use their output here.
             #[allow(unused_must_use)]
@@ -189,33 +219,97 @@ impl Assembler
                 Insn::And { left, right, out } |
                 Insn::Or { left, right, out } |
                 Insn::Xor { left, right, out } => {
-                    match (&left, &right, iterator.peek()) {
-                        // Merge this insn, e.g. `add REG, right -> out`, and `mov REG, out` if possible
-                        (Opnd::Reg(_), Opnd::UImm(value), Some(Insn::Mov { dest, src }))
-                        if out == src && left == dest && live_ranges[index] == index + 1 && uimm_num_bits(*value) <= 32 => {
-                            *out = *dest;
+                    enum BinAction {
+                        Unmerged,
+                        InplaceMerged,
+                        ReplacedWith { new_insn: Insn, pop_mov: bool },
+                    }
+
+                    let mut action = BinAction::Unmerged;
+                    if let Some(Insn::Mov { dest, src } | Insn::Store { dest, src }) = iterator.peek() {
+                        if matches!(out, Opnd::InsnOut { .. }) && *out == *src && live_ranges[index] == index + 1 {
+                            let lowered_dest = lower_peek_dest(&asm, dest);
+                            let can_inplace_reg = matches!(left, Opnd::Reg(_))
+                                && matches!(right, Opnd::Reg(_) | Opnd::Imm(_) | Opnd::UImm(_) | Opnd::Mem(Mem { base: MemBase::Reg(_), .. }))
+                                && (!is_mul || left.num_bits() == Some(64));
+                            let can_inplace_mem = !is_mul
+                                && matches!(left, Opnd::Mem(Mem { base: MemBase::Reg(_), .. }))
+                                && matches!(right, Opnd::Reg(_) | Opnd::Imm(_) | Opnd::UImm(_));
+
+                            if lowered_dest == *left && (can_inplace_reg || can_inplace_mem) {
+                                *out = lowered_dest;
+                                action = BinAction::InplaceMerged;
+                            } else if (is_add || is_sub)
+                                && left.num_bits() == Some(64)
+                                && matches!(left, Opnd::Reg(_) | Opnd::InsnOut { .. })
+                            {
+                                if let (Opnd::Reg(dest_reg), Some(disp)) = (lowered_dest, add_sub_disp32(is_sub, right)) {
+                                    if dest_reg.num_bits == 64 {
+                                        let replacement = if disp == 0 {
+                                            Insn::Mov { dest: Opnd::Reg(dest_reg), src: *left }
+                                        } else {
+                                            Insn::Lea {
+                                                opnd: Opnd::mem(64, *left, disp),
+                                                out: Opnd::Reg(dest_reg),
+                                            }
+                                        };
+                                        action = BinAction::ReplacedWith { new_insn: replacement, pop_mov: true };
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    if matches!(action, BinAction::Unmerged) {
+                        // When `left` is a 64-bit register/InsnOut that stays live past this Add/Sub
+                        // and the next instruction is a Mov/Store (so flags are not read), use
+                        // non-destructive `lea` instead of `mov tmp, left; add/sub tmp, imm`.
+                        let left_needs_preserve = match unmapped_opnds[0] {
+                            Opnd::InsnOut { idx, .. } => live_ranges[idx] > index,
+                            Opnd::Reg(_) => true,
+                            _ => false,
+                        };
+                        if (is_add || is_sub)
+                            && left_needs_preserve
+                            && left.num_bits() == Some(64)
+                            && matches!(left, Opnd::Reg(_) | Opnd::InsnOut { .. })
+                            && matches!(iterator.peek(), Some(Insn::Mov { .. } | Insn::Store { .. }))
+                        {
+                            if let Some(disp) = add_sub_disp32(is_sub, right) {
+                                if disp != 0 {
+                                    let lea_out = asm.next_opnd_out(64);
+                                    action = BinAction::ReplacedWith {
+                                        new_insn: Insn::Lea {
+                                            opnd: Opnd::mem(64, *left, disp),
+                                            out: lea_out,
+                                        },
+                                        pop_mov: false,
+                                    };
+                                }
+                            }
+                        }
+                    }
+
+                    match action {
+                        BinAction::InplaceMerged => {
                             asm.push_insn(insn);
                             iterator.map_insn_index(&mut asm);
                             iterator.next_unmapped(); // Pop merged Insn::Mov
                         }
-                        (Opnd::Reg(_), Opnd::Reg(_), Some(Insn::Mov { dest, src }))
-                        if out == src && live_ranges[index] == index + 1 && {
-                            // We want to do `dest == left`, but `left` has already gone
-                            // through lower_stack_opnd() while `dest` has not. So we
-                            // lower `dest` before comparing.
-                            let lowered_dest = if let Opnd::Stack { .. } = dest {
-                                asm.lower_stack_opnd(dest)
+                        BinAction::ReplacedWith { new_insn, pop_mov } => {
+                            if let Insn::Mov { dest, src } = new_insn {
+                                if !(dest == src && matches!(dest, Opnd::Reg(Reg { num_bits: 64, .. }))) {
+                                    asm.mov(dest, src);
+                                }
                             } else {
-                                *dest
-                            };
-                            lowered_dest == *left
-                        } => {
-                            *out = *dest;
-                            asm.push_insn(insn);
-                            iterator.map_insn_index(&mut asm);
-                            iterator.next_unmapped(); // Pop merged Insn::Mov
+                                asm.push_insn(new_insn);
+                            }
+                            if pop_mov {
+                                iterator.map_insn_index(&mut asm);
+                                iterator.next_unmapped(); // Pop merged Insn::Mov
+                            }
                         }
-                        _ => {
+                        BinAction::Unmerged => {
                             match (unmapped_opnds[0], unmapped_opnds[1]) {
                                 (Opnd::Mem(_), Opnd::Mem(_)) => {
                                     *left = asm.load(*left);
@@ -243,12 +337,19 @@ impl Assembler
                     }
                 },
                 Insn::Cmp { left, right } => {
-                    // Replace `cmp REG, 0` (4 bytes) with `test REG, REG` (3 bytes)
-                    // when next IR is `je`, `jne`, `csel_e`, or `csel_ne`
+                    // Replace `cmp REG, 0` (4 bytes) with `test REG, REG` (3 bytes).
+                    // Note: `r - 0` and `r & r` set ZF, SF, OF=0, CF=0, PF identically.
                     match (&left, &right, iterator.peek()) {
-                        (Opnd::InsnOut { .. },
+                        (Opnd::InsnOut { .. } | Opnd::Reg(_),
                          Opnd::UImm(0) | Opnd::Imm(0),
-                         Some(Insn::Je(_) | Insn::Jne(_) | Insn::CSelE { .. } | Insn::CSelNE { .. })) => {
+                         Some(
+                             Insn::Je(_) | Insn::Jne(_) | Insn::Jz(_) | Insn::Jnz(_) |
+                             Insn::Jl(_) | Insn::Jge(_) | Insn::Jg(_) |
+                             Insn::CSelE { .. } | Insn::CSelNE { .. } |
+                             Insn::CSelZ { .. } | Insn::CSelNZ { .. } |
+                             Insn::CSelL { .. } | Insn::CSelGE { .. } |
+                             Insn::CSelG { .. } | Insn::CSelLE { .. }
+                         )) => {
                             asm.push_insn(Insn::Test { left: *left, right: *left });
                         }
                         _ => {
@@ -272,22 +373,46 @@ impl Assembler
                 Insn::LShift { opnd, shift, out } |
                 Insn::RShift { opnd, shift, out } |
                 Insn::URShift { opnd, shift, out } => {
-                    match (&unmapped_opnds[0], &unmapped_opnds[1]) {
-                        // Instruction output whose live range spans beyond this instruction
-                        (Opnd::InsnOut { idx, .. }, _) => {
-                            if live_ranges[*idx] > index {
-                                *opnd = asm.load(*opnd);
+                    let mut merged = false;
+                    if let Some(Insn::Mov { dest, src } | Insn::Store { dest, src }) = iterator.peek() {
+                        if matches!(out, Opnd::InsnOut { .. })
+                            && *out == *src
+                            && live_ranges[index] == index + 1
+                            && matches!(shift, Opnd::UImm(_))
+                        {
+                            let lowered_dest = lower_peek_dest(&asm, dest);
+                            if lowered_dest == *opnd
+                                && matches!(opnd, Opnd::Reg(_) | Opnd::Mem(Mem { base: MemBase::Reg(_), .. }))
+                            {
+                                *out = lowered_dest;
+                                merged = true;
                             }
-                        },
-                        // We have to load memory operands to avoid corrupting them
-                        (Opnd::Mem(_) | Opnd::Reg(_), _) => {
-                            *opnd = asm.load(*opnd);
-                        },
-                        _ => {}
-                    };
+                        }
+                    }
 
-                    *out = asm.next_opnd_out(Opnd::match_num_bits(&[*opnd, *shift]));
+                    if !merged {
+                        match (&unmapped_opnds[0], &unmapped_opnds[1]) {
+                            // Instruction output whose live range spans beyond this instruction
+                            (Opnd::InsnOut { idx, .. }, _) => {
+                                if live_ranges[*idx] > index {
+                                    *opnd = asm.load(*opnd);
+                                }
+                            },
+                            // We have to load memory operands to avoid corrupting them
+                            (Opnd::Mem(_) | Opnd::Reg(_), _) => {
+                                *opnd = asm.load(*opnd);
+                            },
+                            _ => {}
+                        };
+
+                        *out = asm.next_opnd_out(Opnd::match_num_bits(&[*opnd, *shift]));
+                    }
+
                     asm.push_insn(insn);
+                    if merged {
+                        iterator.map_insn_index(&mut asm);
+                        iterator.next_unmapped(); // Pop merged Insn::Mov
+                    }
                 },
                 Insn::CSelZ { truthy, falsy, out } |
                 Insn::CSelNZ { truthy, falsy, out } |
@@ -297,65 +422,151 @@ impl Assembler
                 Insn::CSelLE { truthy, falsy, out } |
                 Insn::CSelG { truthy, falsy, out } |
                 Insn::CSelGE { truthy, falsy, out } => {
-                    match unmapped_opnds[0] {
-                        // If we have an instruction output whose live range
-                        // spans beyond this instruction, we have to load it.
-                        Opnd::InsnOut { idx, .. } => {
-                            if live_ranges[idx] > index {
-                                *truthy = asm.load(*truthy);
+                    let mut merged = false;
+                    if let Some(Insn::Mov { dest, src } | Insn::Store { dest, src }) = iterator.peek() {
+                        if matches!(out, Opnd::InsnOut { .. }) && *out == *src && live_ranges[index] == index + 1 {
+                            if let Opnd::Reg(dest_reg) = lower_peek_dest(&asm, dest) {
+                                if dest_reg.num_bits == 64 {
+                                    let dest_in_alloc_pool = matches!(dest_reg.reg_no, 0..=2);
+                                    if !dest_in_alloc_pool
+                                        && !opnd_uses_reg_no(falsy, dest_reg.reg_no)
+                                        && !matches!(truthy, Opnd::Mem(m) if m.base == MemBase::Reg(dest_reg.reg_no))
+                                    {
+                                        match unmapped_opnds[0] {
+                                            Opnd::InsnOut { idx, .. } => {
+                                                if live_ranges[idx] > index {
+                                                    *truthy = asm.load(*truthy);
+                                                }
+                                            },
+                                            Opnd::UImm(_) | Opnd::Imm(_) => {
+                                                asm.load_into(Opnd::Reg(dest_reg), *truthy);
+                                                *truthy = Opnd::Reg(dest_reg);
+                                            },
+                                            Opnd::Value(_) if !matches!(truthy, Opnd::InsnOut { .. }) => {
+                                                asm.load_into(Opnd::Reg(dest_reg), *truthy);
+                                                *truthy = Opnd::Reg(dest_reg);
+                                            },
+                                            _ => {}
+                                        };
+
+                                        match falsy {
+                                            Opnd::UImm(_) | Opnd::Imm(_) => {
+                                                if matches!(truthy, Opnd::Mem(_)) && *truthy != Opnd::Reg(dest_reg) {
+                                                    asm.load_into(Opnd::Reg(dest_reg), *falsy);
+                                                    *falsy = Opnd::Reg(dest_reg);
+                                                } else {
+                                                    *falsy = asm.load(*falsy);
+                                                }
+                                            },
+                                            _ => {}
+                                        };
+
+                                        *out = Opnd::Reg(dest_reg);
+                                        merged = true;
+                                    } else if dest_in_alloc_pool
+                                        && !matches!(truthy, Opnd::Mem(_))
+                                        && !matches!(falsy, Opnd::Mem(_))
+                                    {
+                                        match unmapped_opnds[0] {
+                                            Opnd::InsnOut { idx, .. } => {
+                                                if live_ranges[idx] > index {
+                                                    *truthy = asm.load(*truthy);
+                                                }
+                                            },
+                                            Opnd::UImm(_) | Opnd::Imm(_) => {
+                                                *truthy = asm.load(*truthy);
+                                            },
+                                            Opnd::Value(_) if !matches!(truthy, Opnd::InsnOut { .. }) => {
+                                                *truthy = asm.load(*truthy);
+                                            },
+                                            _ => {}
+                                        };
+
+                                        match falsy {
+                                            Opnd::UImm(_) | Opnd::Imm(_) => {
+                                                *falsy = asm.load(*falsy);
+                                            },
+                                            _ => {}
+                                        };
+
+                                        *out = Opnd::Reg(dest_reg);
+                                        merged = true;
+                                    }
+                                }
                             }
-                        },
-                        Opnd::UImm(_) | Opnd::Imm(_) => {
-                            *truthy = asm.load(*truthy);
-                        },
-                        // Opnd::Value could have already been split
-                        Opnd::Value(_) if !matches!(truthy, Opnd::InsnOut { .. }) => {
-                            *truthy = asm.load(*truthy);
-                        },
-                        _ => {}
-                    };
+                        }
+                    }
 
-                    match falsy {
-                        Opnd::UImm(_) | Opnd::Imm(_) => {
-                            *falsy = asm.load(*falsy);
-                        },
-                        _ => {}
-                    };
+                    if !merged {
+                        match unmapped_opnds[0] {
+                            // If we have an instruction output whose live range
+                            // spans beyond this instruction, we have to load it.
+                            Opnd::InsnOut { idx, .. } => {
+                                if live_ranges[idx] > index {
+                                    *truthy = asm.load(*truthy);
+                                }
+                            },
+                            Opnd::UImm(_) | Opnd::Imm(_) => {
+                                *truthy = asm.load(*truthy);
+                            },
+                            // Opnd::Value could have already been split
+                            Opnd::Value(_) if !matches!(truthy, Opnd::InsnOut { .. }) => {
+                                *truthy = asm.load(*truthy);
+                            },
+                            _ => {}
+                        };
 
-                    *out = asm.next_opnd_out(Opnd::match_num_bits(&[*truthy, *falsy]));
+                        match falsy {
+                            Opnd::UImm(_) | Opnd::Imm(_) => {
+                                *falsy = asm.load(*falsy);
+                            },
+                            _ => {}
+                        };
+
+                        *out = asm.next_opnd_out(Opnd::match_num_bits(&[*truthy, *falsy]));
+                    }
+
                     asm.push_insn(insn);
+                    if merged {
+                        iterator.map_insn_index(&mut asm);
+                        iterator.next_unmapped(); // Pop merged Insn::Mov
+                    }
                 },
                 Insn::Mov { dest, src } | Insn::Store { dest, src } => {
-                    match (&dest, &src) {
-                        (Opnd::Mem(_), Opnd::Mem(_)) => {
-                            // We load opnd1 because for mov, opnd0 is the output
-                            let opnd1 = asm.load(*src);
-                            asm.mov(*dest, opnd1);
-                        },
-                        (Opnd::Mem(Mem { num_bits, .. }), Opnd::UImm(value)) => {
-                            // For 64 bit destinations, 32-bit values will be sign-extended
-                            if *num_bits == 64 && imm_num_bits(*value as i64) > 32 {
+                    if *dest == *src && matches!(dest, Opnd::Reg(Reg { num_bits: 64, .. }) | Opnd::Mem(Mem { num_bits: 64, .. })) {
+                        // Elide 64-bit self-moves (never elide 32-bit moves, which zero-extend)
+                    } else {
+                        match (&dest, &src) {
+                            (Opnd::Mem(_), Opnd::Mem(_)) => {
+                                // We load opnd1 because for mov, opnd0 is the output
                                 let opnd1 = asm.load(*src);
                                 asm.mov(*dest, opnd1);
-                            } else {
+                            },
+                            (Opnd::Mem(Mem { num_bits, .. }), Opnd::UImm(value)) => {
+                                // For 64 bit destinations, 32-bit values will be sign-extended
+                                if *num_bits == 64 && imm_num_bits(*value as i64) > 32 {
+                                    let opnd1 = asm.load(*src);
+                                    asm.mov(*dest, opnd1);
+                                } else {
+                                    asm.mov(*dest, *src);
+                                }
+                            },
+                            (Opnd::Mem(Mem { num_bits, .. }), Opnd::Imm(value)) => {
+                                // For 64 bit destinations, 32-bit values will be sign-extended
+                                if *num_bits == 64 && imm_num_bits(*value) > 32 {
+                                    let opnd1 = asm.load(*src);
+                                    asm.mov(*dest, opnd1);
+                                } else if uimm_num_bits(*value as u64) <= *num_bits {
+                                    // If the bit string is short enough for the destination, use the unsigned representation.
+                                    // Note that 64-bit and negative values are ruled out.
+                                    asm.mov(*dest, Opnd::UImm(*value as u64));
+                                } else {
+                                    asm.mov(*dest, *src);
+                                }
+                            },
+                            _ => {
                                 asm.mov(*dest, *src);
                             }
-                        },
-                        (Opnd::Mem(Mem { num_bits, .. }), Opnd::Imm(value)) => {
-                            // For 64 bit destinations, 32-bit values will be sign-extended
-                            if *num_bits == 64 && imm_num_bits(*value) > 32 {
-                                let opnd1 = asm.load(*src);
-                                asm.mov(*dest, opnd1);
-                            } else if uimm_num_bits(*value as u64) <= *num_bits {
-                                // If the bit string is short enough for the destination, use the unsigned representation.
-                                // Note that 64-bit and negative values are ruled out.
-                                asm.mov(*dest, Opnd::UImm(*value as u64));
-                            } else {
-                                asm.mov(*dest, *src);
-                            }
-                        },
-                        _ => {
-                            asm.mov(*dest, *src);
                         }
                     }
                 },
@@ -399,13 +610,35 @@ impl Assembler
                     asm.ccall(*fptr, C_ARG_OPNDS[4..opnds.len().max(4)].to_vec());
                 },
                 Insn::Lea { .. } => {
-                    // Merge `lea` and `mov` into a single `lea` when possible
+                    // Eliminate zero-displacement `lea out, [base + 0]` and merge `lea` + `mov` when possible
                     match (&insn, iterator.peek()) {
-                        (Insn::Lea { opnd, out }, Some(Insn::Mov { dest: Opnd::Reg(reg), src }))
+                        (Insn::Lea { opnd: Opnd::Mem(Mem { base: MemBase::Reg(reg_no), disp: 0, .. }), out }, Some(Insn::Mov { dest, src }))
                         if matches!(out, Opnd::InsnOut { .. }) && out == src && live_ranges[index] == index + 1 => {
-                            asm.push_insn(Insn::Lea { opnd: *opnd, out: Opnd::Reg(*reg) });
+                            let base_reg = Opnd::Reg(X86Reg { num_bits: 64, reg_type: RegType::GP, reg_no: *reg_no });
+                            let lowered_dest = lower_peek_dest(&asm, dest);
+                            if lowered_dest != base_reg {
+                                asm.mov(lowered_dest, base_reg);
+                            }
                             iterator.map_insn_index(&mut asm);
-                            iterator.next_unmapped(); // Pop merged Insn::Mov
+                            iterator.next_unmapped(); // Pop merged Insn::Mov/Store
+                        }
+                        (Insn::Lea { opnd: Opnd::Mem(Mem { base: MemBase::Reg(reg_no), disp: 0, .. }), out: Opnd::InsnOut { .. } }, _) => {
+                            let base_reg = Opnd::Reg(X86Reg { num_bits: 64, reg_type: RegType::GP, reg_no: *reg_no });
+                            asm.load(base_reg);
+                        }
+                        (Insn::Lea { opnd, out }, Some(Insn::Mov { dest, src } | Insn::Store { dest, src }))
+                        if matches!(out, Opnd::InsnOut { .. }) && out == src && live_ranges[index] == index + 1 => {
+                            if let Opnd::Reg(reg) = lower_peek_dest(&asm, dest) {
+                                if reg.num_bits == 64 {
+                                    asm.push_insn(Insn::Lea { opnd: *opnd, out: Opnd::Reg(reg) });
+                                    iterator.map_insn_index(&mut asm);
+                                    iterator.next_unmapped(); // Pop merged Insn::Mov
+                                } else {
+                                    asm.push_insn(insn);
+                                }
+                            } else {
+                                asm.push_insn(insn);
+                            }
                         }
                         _ => asm.push_insn(insn),
                     }
@@ -483,18 +716,15 @@ impl Assembler
             // Assert that output is a register
             out.unwrap_reg();
 
-            // If the truthy value is a memory operand
-            if let Opnd::Mem(_) = truthy {
-                if out != falsy {
-                    mov(cb, out.into(), falsy.into());
-                }
-
+            if out == falsy {
+                cmov_fn(cb, out.into(), truthy.into());
+            } else if out == truthy {
+                cmov_neg(cb, out.into(), falsy.into());
+            } else if let Opnd::Mem(_) = truthy {
+                mov(cb, out.into(), falsy.into());
                 cmov_fn(cb, out.into(), truthy.into());
             } else {
-                if out != truthy {
-                    mov(cb, out.into(), truthy.into());
-                }
-
+                mov(cb, out.into(), truthy.into());
                 cmov_neg(cb, out.into(), falsy.into());
             }
         }
@@ -619,7 +849,11 @@ impl Assembler
                             let ptr_offset: u32 = (cb.get_write_pos() as u32) - (SIZEOF_VALUE as u32);
                             insn_gc_offsets.push(ptr_offset);
                         }
-                        _ => mov(cb, out.into(), opnd.into())
+                        _ => {
+                            if !(out == opnd && matches!(out, Opnd::Reg(Reg { num_bits: 64, .. }))) {
+                                mov(cb, out.into(), opnd.into());
+                            }
+                        }
                     }
                 },
 
@@ -628,7 +862,9 @@ impl Assembler
                 },
 
                 Insn::Mov { dest, src } => {
-                    mov(cb, dest.into(), src.into());
+                    if !(dest == src && matches!(dest, Opnd::Reg(Reg { num_bits: 64, .. }))) {
+                        mov(cb, dest.into(), src.into());
+                    }
                 },
 
                 // Load effective address
@@ -951,7 +1187,7 @@ mod tests {
         let _ = asm.add(Opnd::Reg(RAX_REG), Opnd::UImm(0xFF));
         asm.compile_with_num_regs(&mut cb, 1);
 
-        assert_eq!(format!("{:x}", cb), "4889c04881c0ff000000");
+        assert_eq!(format!("{:x}", cb), "4881c0ff000000");
     }
 
     #[test]
@@ -961,7 +1197,7 @@ mod tests {
         let _ = asm.add(Opnd::Reg(RAX_REG), Opnd::UImm(0xFFFF_FFFF_FFFF));
         asm.compile_with_num_regs(&mut cb, 1);
 
-        assert_eq!(format!("{:x}", cb), "4889c049bbffffffffffff00004c01d8");
+        assert_eq!(format!("{:x}", cb), "49bbffffffffffff00004c01d8");
     }
 
     #[test]
@@ -971,7 +1207,7 @@ mod tests {
         let _ = asm.and(Opnd::Reg(RAX_REG), Opnd::UImm(0xFF));
         asm.compile_with_num_regs(&mut cb, 1);
 
-        assert_eq!(format!("{:x}", cb), "4889c04881e0ff000000");
+        assert_eq!(format!("{:x}", cb), "4881e0ff000000");
     }
 
     #[test]
@@ -981,7 +1217,7 @@ mod tests {
         let _ = asm.and(Opnd::Reg(RAX_REG), Opnd::UImm(0xFFFF_FFFF_FFFF));
         asm.compile_with_num_regs(&mut cb, 1);
 
-        assert_eq!(format!("{:x}", cb), "4889c049bbffffffffffff00004c21d8");
+        assert_eq!(format!("{:x}", cb), "49bbffffffffffff00004c21d8");
     }
 
     #[test]
@@ -1035,7 +1271,7 @@ mod tests {
         let _ = asm.or(Opnd::Reg(RAX_REG), Opnd::UImm(0xFF));
         asm.compile_with_num_regs(&mut cb, 1);
 
-        assert_eq!(format!("{:x}", cb), "4889c04881c8ff000000");
+        assert_eq!(format!("{:x}", cb), "4881c8ff000000");
     }
 
     #[test]
@@ -1045,7 +1281,7 @@ mod tests {
         let _ = asm.or(Opnd::Reg(RAX_REG), Opnd::UImm(0xFFFF_FFFF_FFFF));
         asm.compile_with_num_regs(&mut cb, 1);
 
-        assert_eq!(format!("{:x}", cb), "4889c049bbffffffffffff00004c09d8");
+        assert_eq!(format!("{:x}", cb), "49bbffffffffffff00004c09d8");
     }
 
     #[test]
@@ -1055,7 +1291,7 @@ mod tests {
         let _ = asm.sub(Opnd::Reg(RAX_REG), Opnd::UImm(0xFF));
         asm.compile_with_num_regs(&mut cb, 1);
 
-        assert_eq!(format!("{:x}", cb), "4889c04881e8ff000000");
+        assert_eq!(format!("{:x}", cb), "4881e8ff000000");
     }
 
     #[test]
@@ -1065,7 +1301,7 @@ mod tests {
         let _ = asm.sub(Opnd::Reg(RAX_REG), Opnd::UImm(0xFFFF_FFFF_FFFF));
         asm.compile_with_num_regs(&mut cb, 1);
 
-        assert_eq!(format!("{:x}", cb), "4889c049bbffffffffffff00004c29d8");
+        assert_eq!(format!("{:x}", cb), "49bbffffffffffff00004c29d8");
     }
 
     #[test]
@@ -1095,7 +1331,7 @@ mod tests {
         let _ = asm.xor(Opnd::Reg(RAX_REG), Opnd::UImm(0xFF));
         asm.compile_with_num_regs(&mut cb, 1);
 
-        assert_eq!(format!("{:x}", cb), "4889c04881f0ff000000");
+        assert_eq!(format!("{:x}", cb), "4881f0ff000000");
     }
 
     #[test]
@@ -1105,7 +1341,7 @@ mod tests {
         let _ = asm.xor(Opnd::Reg(RAX_REG), Opnd::UImm(0xFFFF_FFFF_FFFF));
         asm.compile_with_num_regs(&mut cb, 1);
 
-        assert_eq!(format!("{:x}", cb), "4889c049bbffffffffffff00004c31d8");
+        assert_eq!(format!("{:x}", cb), "49bbffffffffffff00004c31d8");
     }
 
     #[test]
@@ -1145,7 +1381,55 @@ mod tests {
         asm.mov(Opnd::Reg(RAX_REG), result);
         asm.compile_with_num_regs(&mut cb, 2);
 
-        assert_eq!(format!("{:x}", cb), "488b43084885c0b814000000b900000000480f45c14889c0");
+        assert_eq!(format!("{:x}", cb), "488b43084885c0b814000000b900000000480f45c1");
+    }
+
+    #[test]
+    fn test_lea_zero_disp_elision() {
+        let (mut asm, mut cb) = setup_asm();
+
+        let caller_sp = asm.lea(Opnd::mem(64, SP, 0));
+        asm.mov(Opnd::mem(64, CFP, 8), caller_sp);
+        let same_sp = asm.lea(Opnd::mem(64, SP, 0));
+        asm.mov(SP, same_sp);
+        asm.compile_with_num_regs(&mut cb, 1);
+
+        // `lea rax, [rbx]; mov [r13 + 8], rax` -> `mov [r13 + 8], rbx`, and `lea rbx, [rbx]` -> elided
+        assert_disasm!(cb, "49895d08", {"
+            0x0: mov qword ptr [r13 + 8], rbx
+        "});
+    }
+
+    #[test]
+    fn test_csel_coalesce_temp_reg() {
+        let (mut asm, mut cb) = setup_asm();
+
+        asm.cmp(Opnd::Reg(RSI_REG), Opnd::Reg(RDI_REG));
+        let res = asm.csel_l(Qtrue.into(), Qfalse.into());
+        asm.mov(Opnd::Reg(RSI_REG), res);
+        asm.compile_with_num_regs(&mut cb, 1);
+
+        assert_disasm!(cb, "4839febe14000000b800000000480f4df0", {"
+            0x0: cmp rsi, rdi
+            0x3: mov esi, 0x14
+            0x8: mov eax, 0
+            0xd: cmovge rsi, rax
+        "});
+    }
+
+    #[test]
+    fn test_add_imm_to_other_reg_uses_lea() {
+        let (mut asm, mut cb) = setup_asm();
+
+        let val = asm.load(Opnd::mem(64, SP, 0));
+        let res = asm.add(val, Opnd::Imm(1));
+        asm.mov(Opnd::Reg(RDI_REG), res);
+        asm.compile_with_num_regs(&mut cb, 1);
+
+        assert_disasm!(cb, "488b03488d7801", {"
+            0x0: mov rax, qword ptr [rbx]
+            0x3: lea rdi, [rax + 1]
+        "});
     }
 
     #[test]
