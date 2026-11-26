@@ -803,12 +803,10 @@ pub fn cqo(cb: &mut CodeBlock) {
 /// imul - signed integer multiply
 pub fn imul(cb: &mut CodeBlock, opnd0: X86Opnd, opnd1: X86Opnd) {
     assert!(opnd0.num_bits() == 64);
-    assert!(opnd1.num_bits() == 64);
-    assert!(matches!(opnd0, X86Opnd::Reg(_) | X86Opnd::Mem(_)));
-    assert!(matches!(opnd1, X86Opnd::Reg(_) | X86Opnd::Mem(_)));
 
     match (opnd0, opnd1) {
         (X86Opnd::Reg(_), X86Opnd::Reg(_) | X86Opnd::Mem(_)) => {
+            assert!(opnd1.num_bits() == 64);
             //REX.W + 0F AF /rIMUL r64, r/m64
             // Quadword register := Quadword register * r/m64.
             write_rm(cb, false, true, opnd0, opnd1, None, &[0x0F, 0xAF]);
@@ -816,9 +814,37 @@ pub fn imul(cb: &mut CodeBlock, opnd0: X86Opnd, opnd1: X86Opnd) {
 
         // Flip the operands to handle this case. This instruction has weird encoding restrictions.
         (X86Opnd::Mem(_), X86Opnd::Reg(_)) => {
+            assert!(opnd1.num_bits() == 64);
             //REX.W + 0F AF /rIMUL r64, r/m64
             // Quadword register := Quadword register * r/m64.
             write_rm(cb, false, true, opnd1, opnd0, None, &[0x0F, 0xAF]);
+        }
+
+        (X86Opnd::Reg(_), X86Opnd::Imm(imm)) => {
+            assert!(imm.num_bits <= 32);
+            if imm.num_bits <= 8 {
+                // REX.W + 6B /r ib IMUL r64, r/m64, imm8
+                write_rm(cb, false, true, opnd0, opnd0, None, &[0x6B]);
+                cb.write_int(imm.value as u64, 8);
+            } else {
+                // REX.W + 69 /r id IMUL r64, r/m64, imm32
+                write_rm(cb, false, true, opnd0, opnd0, None, &[0x69]);
+                cb.write_int(imm.value as u64, 32);
+            }
+        }
+
+        (X86Opnd::Reg(_), X86Opnd::UImm(uimm)) => {
+            let num_bits = imm_num_bits(uimm.value as i64);
+            assert!(num_bits <= 32);
+            if num_bits <= 8 {
+                // REX.W + 6B /r ib IMUL r64, r/m64, imm8
+                write_rm(cb, false, true, opnd0, opnd0, None, &[0x6B]);
+                cb.write_int(uimm.value, 8);
+            } else {
+                // REX.W + 69 /r id IMUL r64, r/m64, imm32
+                write_rm(cb, false, true, opnd0, opnd0, None, &[0x69]);
+                cb.write_int(uimm.value, 32);
+            }
         }
 
         _ => unreachable!()
@@ -964,19 +990,23 @@ pub fn mov(cb: &mut CodeBlock, dst: X86Opnd, src: X86Opnd) {
     match (dst, src) {
         // R + Imm
         (X86Opnd::Reg(reg), X86Opnd::Imm(imm)) => {
-            assert!(imm.num_bits <= reg.num_bits);
-
             // In case the source immediate could be zero extended to be 64
             // bit, we can use the 32-bit operands version of the instruction.
             // For example, we can turn mov(rax, 0x34) into the equivalent
-            // mov(eax, 0x34).
-            if (reg.num_bits == 64) && (imm.value > 0) && (imm.num_bits <= 32) {
+            // mov(eax, 0x34), and mov(rax, 0) into mov(eax, 0) without clobbering flags.
+            if (reg.num_bits == 64) && (imm.value >= 0) && (imm.value <= u32::MAX as i64) {
                 if dst.rex_needed() {
                     write_rex(cb, false, 0, 0, reg.reg_no);
                 }
                 write_opcode(cb, 0xB8, reg);
                 cb.write_int(imm.value as u64, 32);
+            } else if (reg.num_bits == 64) && (imm.value < 0) && (imm.value >= i32::MIN as i64) {
+                // Sign-extend 32-bit immediate to 64 bits (REX.W C7 /0 id, 7 bytes vs 10-byte movabs)
+                write_rm(cb, false, true, X86Opnd::None, dst, Some(0), &[0xc7]);
+                cb.write_int(imm.value as u64, 32);
             } else {
+                assert!(imm.num_bits <= reg.num_bits);
+
                 if reg.num_bits == 16 {
                     cb.write_byte(0x66);
                 }
@@ -1379,16 +1409,40 @@ pub fn test(cb: &mut CodeBlock, rm_opnd: X86Opnd, test_opnd: X86Opnd) {
             assert!(uimm.num_bits <= 32);
             assert!(uimm.num_bits <= rm_num_bits);
 
-            // Use the smallest operand size possible
+            // Use the smallest operand size possible, except widen 16-bit immediates
+            // to 32 bits when `rm_num_bits >= 32` to avoid `0x66 F7 /0 iw`, which triggers
+            // a 3-cycle Length-Changing Prefix (LCP) decode stall on Intel cores.
             assert!(rm_num_bits % 8 == 0);
-            let rm_resized = resize_opnd(rm_opnd, uimm.num_bits);
-
-            if uimm.num_bits == 8 {
-                write_rm(cb, false, false, X86Opnd::None, rm_resized, Some(0x00), &[0xf6]);
-                cb.write_int(uimm.value, uimm.num_bits.into());
+            let opnd_bits = if uimm.num_bits == 16 && rm_num_bits >= 32 {
+                32
             } else {
-                write_rm(cb, uimm.num_bits == 16, false, X86Opnd::None, rm_resized, Some(0x00), &[0xf7]);
-                cb.write_int(uimm.value, uimm.num_bits.into());
+                uimm.num_bits
+            };
+            let rm_resized = resize_opnd(rm_opnd, opnd_bits);
+
+            if opnd_bits == 8 {
+                if let X86Opnd::Reg(reg) = rm_resized {
+                    if reg.reg_no == RAX_REG_NO {
+                        cb.write_byte(0xa8);
+                        cb.write_int(uimm.value, 8);
+                        return;
+                    }
+                }
+                write_rm(cb, false, false, X86Opnd::None, rm_resized, Some(0x00), &[0xf6]);
+                cb.write_int(uimm.value, 8);
+            } else {
+                if let X86Opnd::Reg(reg) = rm_resized {
+                    if reg.reg_no == RAX_REG_NO {
+                        if opnd_bits == 16 {
+                            cb.write_byte(0x66);
+                        }
+                        cb.write_byte(0xa9);
+                        cb.write_int(uimm.value, opnd_bits.into());
+                        return;
+                    }
+                }
+                write_rm(cb, opnd_bits == 16, false, X86Opnd::None, rm_resized, Some(0x00), &[0xf7]);
+                cb.write_int(uimm.value, opnd_bits.into());
             }
         },
         X86Opnd::Imm(imm) => {
@@ -1396,6 +1450,13 @@ pub fn test(cb: &mut CodeBlock, rm_opnd: X86Opnd, test_opnd: X86Opnd) {
             assert!(imm.num_bits <= 32);
             assert!(rm_num_bits == 64);
 
+            if let X86Opnd::Reg(reg) = rm_opnd {
+                if reg.reg_no == RAX_REG_NO {
+                    cb.write_bytes(&[0x48, 0xa9]);
+                    cb.write_int(imm.value as u64, 32);
+                    return;
+                }
+            }
             write_rm(cb, false, true, X86Opnd::None, rm_opnd, Some(0x00), &[0xf7]);
             cb.write_int(imm.value as u64, 32);
         },

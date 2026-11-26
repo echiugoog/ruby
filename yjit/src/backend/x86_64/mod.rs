@@ -261,6 +261,15 @@ impl Assembler
                     }
                 },
                 Insn::Test { left, right } => {
+                    if let Opnd::Imm(val) = *right {
+                        if val >= 0 && (val as u64) <= u32::MAX as u64 {
+                            if let Some(bits) = left.num_bits() {
+                                if uimm_num_bits(val as u64) <= bits {
+                                    *right = Opnd::UImm(val as u64);
+                                }
+                            }
+                        }
+                    }
                     if let (Opnd::Mem(_), Opnd::Mem(_)) = (&left, &right) {
                         let loaded = asm.load(*right);
                         *right = loaded;
@@ -735,8 +744,15 @@ impl Assembler
 
                 // Test and set flags
                 Insn::Test { left, right } => {
-                    let emitted = emit_64bit_immediate(cb, right);
-                    test(cb, left.into(), emitted);
+                    match right {
+                        Opnd::UImm(value) if *value <= u32::MAX as u64 && uimm_num_bits(*value) <= left.rm_num_bits() => {
+                            test(cb, left.into(), right.into());
+                        }
+                        _ => {
+                            let emitted = emit_64bit_immediate(cb, right);
+                            test(cb, left.into(), emitted);
+                        }
+                    }
                 }
 
                 Insn::JmpOpnd(opnd) => {
@@ -1075,7 +1091,7 @@ mod tests {
         asm.test(Opnd::Reg(RAX_REG), Opnd::UImm(0xFF));
         asm.compile_with_num_regs(&mut cb, 0);
 
-        assert_eq!(format!("{:x}", cb), "f6c0ff");
+        assert_eq!(format!("{:x}", cb), "a8ff");
     }
 
     #[test]
@@ -1146,6 +1162,18 @@ mod tests {
         asm.compile_with_num_regs(&mut cb, 2);
 
         assert_eq!(format!("{:x}", cb), "488b43084885c0b814000000b900000000480f45c14889c0");
+    }
+
+    #[test]
+    fn test_test_uimm_bit31() {
+        let (mut asm, mut cb) = setup_asm();
+
+        asm.test(Opnd::mem(64, Opnd::Reg(RAX_REG), 0), Opnd::UImm(0x8000_0000));
+        asm.compile_with_num_regs(&mut cb, 0);
+
+        assert_disasm!(cb, "f70000000080", {"
+            0x0: test dword ptr [rax], 0x80000000
+        "});
     }
 
     #[test]

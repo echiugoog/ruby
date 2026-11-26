@@ -112,6 +112,11 @@ fn test_imul() {
 
     // Operands flipped for encoding since multiplication is commutative
     check_bytes("480faf10", |cb| imul(cb, mem_opnd(64, RAX, 0), RDX));
+
+    // Immediate encodings (imm8 and imm32)
+    check_bytes("486bc003", |cb| imul(cb, RAX, imm_opnd(3)));
+    check_bytes("4d6bc9fd", |cb| imul(cb, R9, imm_opnd(-3)));
+    check_bytes("4869c000010000", |cb| imul(cb, RAX, uimm_opnd(0x100)));
 }
 
 #[test]
@@ -174,16 +179,18 @@ fn test_mov() {
     check_bytes("8b9380000000", |cb| mov(cb, EDX, mem_opnd(32, RBX, 128)));
     check_bytes("488b442404", |cb| mov(cb, RAX, mem_opnd(64, RSP, 4)));
 
-    // Test `mov rax, 3` => `mov eax, 3` optimization
+    // Test `mov rax, 3` => `mov eax, 3` and 32-bit sign-extended mov optimizations
+    check_bytes("b800000000", |cb| mov(cb, RAX, imm_opnd(0)));
+    check_bytes("41b800000000", |cb| mov(cb, R8, imm_opnd(0)));
     check_bytes("41b834000000", |cb| mov(cb, R8, imm_opnd(0x34)));
-    check_bytes("49b80000008000000000", |cb| mov(cb, R8, imm_opnd(0x80000000)));
-    check_bytes("49b8ffffffffffffffff", |cb| mov(cb, R8, imm_opnd(-1)));
+    check_bytes("41b800000080", |cb| mov(cb, R8, imm_opnd(0x80000000)));
+    check_bytes("49c7c0ffffffff", |cb| mov(cb, R8, imm_opnd(-1)));
 
     check_bytes("b834000000", |cb| mov(cb, RAX, imm_opnd(0x34)));
     check_bytes("48b8020000000000c0ff", |cb| mov(cb, RAX, imm_opnd(-18014398509481982)));
-    check_bytes("48b80000008000000000", |cb| mov(cb, RAX, imm_opnd(0x80000000)));
-    check_bytes("48b8ccffffffffffffff", |cb| mov(cb, RAX, imm_opnd(-52))); // yasm thinks this could use a dword immediate instead of qword
-    check_bytes("48b8ffffffffffffffff", |cb| mov(cb, RAX, imm_opnd(-1))); // yasm thinks this could use a dword immediate instead of qword
+    check_bytes("b800000080", |cb| mov(cb, RAX, imm_opnd(0x80000000)));
+    check_bytes("48c7c0ccffffff", |cb| mov(cb, RAX, imm_opnd(-52)));
+    check_bytes("48c7c0ffffffff", |cb| mov(cb, RAX, imm_opnd(-1)));
     check_bytes("4488c9", |cb| mov(cb, CL, R9B));
     check_bytes("4889c3", |cb| mov(cb, RBX, RAX));
     check_bytes("4889df", |cb| mov(cb, RDI, RBX));
@@ -398,7 +405,12 @@ fn test_test() {
     check_bytes("48f74640f7ffffff", |cb| test(cb, mem_opnd(64, RSI, 64), imm_opnd(!0x08)));
     check_bytes("48f7464008000000", |cb| test(cb, mem_opnd(64, RSI, 64), imm_opnd(0x08)));
     check_bytes("48f7c108000000", |cb| test(cb, RCX, imm_opnd(0x08)));
-    //check_bytes("48a9f7ffff0f", |cb| test(cb, RAX, imm_opnd(0x0FFFFFF7)));
+    check_bytes("48a9f7ffff0f", |cb| test(cb, RAX, imm_opnd(0x0FFFFFF7)));
+    // LCP-free 32-bit widening when rm_num_bits >= 32 and uimm is 16-bit
+    check_bytes("f70000200000", |cb| test(cb, mem_opnd(64, RAX, 0), uimm_opnd(0x2000)));
+    check_bytes("f7c100200000", |cb| test(cb, RCX, uimm_opnd(0x2000)));
+    check_bytes("a900200000", |cb| test(cb, RAX, uimm_opnd(0x2000)));
+    check_bytes("a801", |cb| test(cb, RAX, uimm_opnd(1)));
 }
 
 #[test]
