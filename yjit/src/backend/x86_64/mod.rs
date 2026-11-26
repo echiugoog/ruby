@@ -647,11 +647,23 @@ impl Assembler
 
                         mov(cb, out.into(), Self::SCRATCH0);
                     } else {
-                        // Set output to the jump target's raw address
                         let target_code = target.unwrap_code_ptr();
-                        let target_addr = target_code.raw_addr(cb).as_u64();
-                        // Constant encoded length important for patching
-                        movabs(cb, out.into(), target_addr);
+                        // When the executable memory region fits in a signed 32-bit offset
+                        // (default is 128 MiB), emit constant-length 7-byte RIP-relative LEA
+                        // instead of 10-byte `movabs` (saving 3 bytes and 1 Intel DSB slot).
+                        if cb.get_mem_size() <= i32::MAX as usize {
+                            let end_ptr = cb.get_ptr(cb.get_write_pos() + 7);
+                            let rel64 = target_code.as_offset() - end_ptr.as_offset();
+                            if let Ok(rel32) = i32::try_from(rel64) {
+                                lea(cb, out.into(), mem_opnd(8, RIP, rel32));
+                            } else {
+                                cb.set_dropped_bytes(true);
+                            }
+                        } else {
+                            let target_addr = target_code.raw_addr(cb).as_u64();
+                            // Constant encoded length important for patching
+                            movabs(cb, out.into(), target_addr);
+                        }
                     }
                 },
 
@@ -1146,6 +1158,19 @@ mod tests {
         asm.compile_with_num_regs(&mut cb, 2);
 
         assert_eq!(format!("{:x}", cb), "488b43084885c0b814000000b900000000480f45c14889c0");
+    }
+
+    #[test]
+    fn test_lea_jump_target_rip_rel() {
+        let (mut asm, mut cb) = setup_asm();
+
+        let target_ptr = cb.get_ptr(0x100);
+        let raw_ptr = asm.lea_jump_target(Target::CodePtr(target_ptr));
+        asm.mov(Opnd::mem(64, CFP, -8), raw_ptr);
+        asm.compile_with_num_regs(&mut cb, 1);
+
+        // 7-byte RIP-relative LEA (disp = 0x100 - 7 = 0xf9) + 4-byte store = 11 bytes
+        assert_eq!(format!("{:x}", cb), "488d05f9000000498945f8");
     }
 
     #[test]
